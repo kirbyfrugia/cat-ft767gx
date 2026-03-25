@@ -183,7 +183,7 @@ def test(serial_port):
   cat_command(serial_port, command)
 
   print("Set Mode to USB")
-  command = YaesuCommand("set mode", YaesuInstruction.MODESEL, 5, parse_status_update_5byte, 
+  command = YaesuCommand("set mode", YaesuInstruction.MODESEL, 8, parse_status_update_8byte, 
                          data1=0x11)
   cat_command(serial_port, command)
 
