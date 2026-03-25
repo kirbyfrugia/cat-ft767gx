@@ -1,4 +1,3 @@
-import atexit
 from dataclasses import dataclass, field
 from enum import Enum
 import math
@@ -17,7 +16,7 @@ class YaesuMemoryChannel:
 # what's with the shadow stuff? These are cases
 # where the radio's precision doesn't match what
 # callers expect, so when we do a "set" we keep
-# the shadow copy.
+# the shadow copy to fool the caller.
 @dataclass
 class YaesuState:
   status_flags: int = 0
@@ -30,9 +29,11 @@ class YaesuState:
   clarifier_ctcss_tone: int = 0
   clarifier_mode: int = 0
   vfoa_frequency: int = 0
+  vfoa_frequency_shadow: int = 0
   vfoa_ctcss_tone: int = 0
   vfoa_mode: int = 0
   vfob_frequency: int = 0
+  vfob_frequency_shadow: int = 0
   vfob_ctcss_tone: int = 0
   vfob_mode: int = 0
   memory_channels: list[YaesuMemoryChannel] = field(
@@ -100,10 +101,16 @@ class HamlibError:
   def to_response(cls, code):
     return f"RPRT {code}"
 
+@dataclass
+class RigctlState:
+  tx_vfo: str = ""
+
+
 serial_port = None
 ack_command = YaesuCommand("ACK", YaesuInstruction.ACK, 0, None)
 
 yaesu_state = YaesuState()
+rigctl_state = RigctlState()
 
 def close_serial_port(serial_port):
   print("Closing serial port...")
@@ -142,9 +149,9 @@ def frequency_to_list(frequency):
 # yaesu precision is less than the hamlib's, so we keep
 # the value hamlib tried to set. we respond with hamlib's
 # if the values are equal at the yaesu precision.
-def get_shadow_freqeuncy(yaesu_frequency, shadow_frequency):
+def get_shadow_frequency(yaesu_frequency, shadow_frequency):
   truncated = math.floor(shadow_frequency / 10)*10
-  print(f"yaesu: {yaesu_frequency}, shadow: {shadow_frequency}, truncated: {truncated}")
+  # print(f"yaesu: {yaesu_frequency}, shadow: {shadow_frequency}, truncated: {truncated}")
   return shadow_frequency if yaesu_frequency == truncated else yaesu_frequency
   
 
@@ -184,18 +191,39 @@ def parse_status_update_86byte(status_update):
   return
 
 def cat_command(serial_port, yaesu_command):
-  print(f"Sending command: {yaesu_command.friendly_name}")
-  command_bytes = yaesu_command.to_bytes()
-  serial_port.write(command_bytes)
-  time.sleep(0.005)
-  echo_bytes = serial_port.read_until(size=5)
-  # print(f"command echo response: {list(echo_bytes)}")
+  max_retries = 3
+  last_exception = None
 
-  if command_bytes != echo_bytes:
-    raise ValueError(f"cat command error. echo does not match data. data: {command_bytes}, echo: {echo_bytes}")
+  for attempt in range(max_retries):
+    try:
+      print(f"Sending command: {yaesu_command.friendly_name} (Attempt {attempt + 1}/{max_retries})")
+      command_bytes = yaesu_command.to_bytes()
 
-  serial_port.write(ack_command.to_bytes())
-  time.sleep(0.005)
+      # clear buffers, just in case
+      serial_port.reset_input_buffer()
+      serial_port.reset_output_buffer()
+
+      serial_port.write(command_bytes)
+      time.sleep(0.005)
+      echo_bytes = serial_port.read_until(size=5)
+
+      if command_bytes != echo_bytes:
+        raise ValueError(f"cat command error. echo does not match data. data: {command_bytes}, echo: {echo_bytes}")
+
+      serial_port.write(ack_command.to_bytes())
+      time.sleep(0.005)
+
+      # If we get here, the command was sent and ack'd successfully.
+      last_exception = None
+      break
+
+    except Exception as e:
+      last_exception = e
+      print(f"Command failed on attempt {attempt + 1}: {e}")
+      time.sleep(0.05) # Small delay before retrying
+  
+  if last_exception:
+    raise last_exception # Re-raise the last exception if all retries failed
 
   # reverse the order of the byte array just to make it easier to deal
   # with varying length responses
@@ -203,7 +231,6 @@ def cat_command(serial_port, yaesu_command):
   status_update.reverse()
   # print(f"Status update: {status_update}\n")
   yaesu_command.response_parser(status_update)
-
 
   return
 
@@ -317,7 +344,7 @@ def handle_get_vfo(serial_port, cmd_args):
   command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
   cat_command(serial_port, command)
   status = yaesu_state.status_flags & 0b00010000
-  response = "VFO: VFOA" if status == 0 else "VFO: VFOB"
+  response = "VFOA" if status == 0 else "VFOB"
   return response
 
 def handle_set_vfo(serial_port, cmd_args):
@@ -345,7 +372,7 @@ def handle_set_vfo(serial_port, cmd_args):
 def handle_get_freq(serial_port, cmd_args):
   command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
   cat_command(serial_port, command)
-  frequency = get_shadow_freqeuncy(yaesu_state.operating_frequency, yaesu_state.operating_frequency_shadow)
+  frequency = get_shadow_frequency(yaesu_state.operating_frequency, yaesu_state.operating_frequency_shadow)
   response = f"{frequency}"
   return response
 
@@ -353,7 +380,7 @@ def handle_set_freq(serial_port, cmd_args):
   freq = int(float(cmd_args[0]))
   yaesu_state.operating_frequency_shadow = freq
   freq_list = frequency_to_list(freq)
-  print(freq_list)
+
   command = YaesuCommand("set freq", YaesuInstruction.FREQ_SET, 5, parse_status_update_5byte,
                          data1=freq_list[0],
                          data2=freq_list[1],
@@ -381,6 +408,164 @@ def handle_get_mode(serial_port, cmd_args):
 
   return response
 
+def handle_set_mode(serial_port, cmd_args):
+  requested_mode = cmd_args[0]
+  
+  match requested_mode:
+    case "LSB":
+      mode_num = 0x10
+    case "USB":
+      mode_num = 0x11
+    case "CW":
+      mode_num = 0x12
+    case "AM":
+      mode_num = 0x13
+    case "FM":
+      mode_num = 0x14
+    case "FSK":
+      mode_num = 0x15
+    case _:
+      return HamlibError.to_response(HamlibError.RIG_EINVAL)
+
+  # set the mode
+  command = YaesuCommand("set mode", YaesuInstruction.MODESEL, 5, parse_status_update_5byte,
+                         data1=mode_num)
+  cat_command(serial_port, command)
+
+  return HamlibError.to_response(HamlibError.RIG_OK)
+
+def handle_get_split_vfo(serial_port, cmd_args):
+  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
+  cat_command(serial_port, command)
+  split = (yaesu_state.status_flags & 0b00001000) >> 3
+  split_str = f"{split}"
+  tx_vfo = rigctl_state.tx_vfo
+  return f"{split_str}\n{tx_vfo}"
+
+def handle_set_split_vfo(serial_port, cmd_args):
+  target_split = int(cmd_args[0])
+  tx_vfo = cmd_args[1]
+
+  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
+  cat_command(serial_port, command)
+  
+  current_split = 1 if (yaesu_state.status_flags & 0b00001000) else 0
+  if target_split != current_split:
+    command = YaesuCommand("toggle split", YaesuInstruction.SPLIT_TOG, 26, parse_status_update_26byte)
+    cat_command(serial_port, command)
+
+  rigctl_state.tx_vfo = tx_vfo
+
+  return HamlibError.to_response(HamlibError.RIG_OK)
+
+def handle_get_split_freq(serial_port, cmd_args):
+  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
+  cat_command(serial_port, command)
+  tx_freq = yaesu_state.vfob_frequency if rigctl_state.tx_vfo == "VFOB" else yaesu_state.vfoa_frequency
+  tx_freq_shadow = yaesu_state.vfob_frequency_shadow if rigctl_state.tx_vfo == "VFOB" else yaesu_state.vfoa_frequency_shadow
+  freq = get_shadow_frequency(tx_freq, tx_freq_shadow)
+  return f"{freq}"
+
+def handle_set_split_freq(serial_port, cmd_args):
+  freq = int(float(cmd_args[0]))
+
+  # first check to see if the frequency needs to change for tx freq
+  current_tx_freq = yaesu_state.vfoa_frequency_shadow if rigctl_state.tx_vfo == "VFOA" else yaesu_state.vfob_frequency_shadow
+  if current_tx_freq == freq:
+    return HamlibError.to_response(HamlibError.RIG_OK)
+  
+  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
+  cat_command(serial_port, command)
+
+  # need to swap VFOs if we are setting transmit VFO but that VFO is not active
+  active_vfo = (yaesu_state.status_flags & 0b00010000) >> 4
+  tx_vfo = 0 if rigctl_state.tx_vfo == "VFOA" else 1
+  if active_vfo != tx_vfo:
+    handle_set_vfo(serial_port, [tx_vfo])
+  
+  # set the shadow frequency
+  if tx_vfo == 0:
+    yaesu_state.vfoa_frequency_shadow = freq
+  else:
+    yaesu_state.vfob_frequency_shadow = freq
+
+  # set the tx vfo frequency
+  freq_list = frequency_to_list(freq)
+  command = YaesuCommand("set freq", YaesuInstruction.FREQ_SET, 5, parse_status_update_5byte,
+                         data1=freq_list[0],
+                         data2=freq_list[1],
+                         data3=freq_list[2],
+                         data4=freq_list[3])
+  cat_command(serial_port, command)
+
+  # if we swapped VFOs, swap back to original VFO
+  if active_vfo != tx_vfo:
+    handle_set_vfo(serial_port, [active_vfo])
+
+  response = HamlibError.to_response(HamlibError.RIG_OK)
+  return response
+
+def handle_get_split_mode(serial_port, cmd_args):
+  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
+  cat_command(serial_port, command)
+
+  modes = {
+    0: ("LSB", 2400),
+    1: ("USB", 2400),
+    2: ("CW", 500),
+    3: ("AM", 6000),
+    4: ("FM", 15000),
+    5: ("FSK", 500)
+  }
+  tx_mode = yaesu_state.vfob_mode if rigctl_state.tx_vfo == "VFOB" else yaesu_state.vfoa_mode
+  mode = modes[tx_mode & 0b00000111]
+  return f"{mode[0]}\n{mode[1]}"
+
+def handle_set_split_mode(serial_port, cmd_args):
+  requested_mode = cmd_args[0]
+
+  match requested_mode:
+    case "LSB":
+      mode_num = 0x10
+    case "USB":
+      mode_num = 0x11
+    case "CW":
+      mode_num = 0x12
+    case "AM":
+      mode_num = 0x13
+    case "FM":
+      mode_num = 0x14
+    case "FSK":
+      mode_num = 0x15
+    case _:
+      return HamlibError.to_response(HamlibError.RIG_EINVAL)
+
+  # first check to see if the mode needs to change for tx mode
+  current_tx_mode = yaesu_state.vfoa_mode if rigctl_state.tx_vfo == "VFOA" else yaesu_state.vfob_mode
+  if current_tx_mode == mode_num:
+    return HamlibError.to_response(HamlibError.RIG_OK)
+
+  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
+  cat_command(serial_port, command)
+
+  # need to swap VFOs if we are setting transmit VFO but that VFO is not active
+  active_vfo = (yaesu_state.status_flags & 0b00010000) >> 4
+  tx_vfo = 0 if rigctl_state.tx_vfo == "VFOA" else 1
+  if active_vfo != tx_vfo:
+    handle_set_vfo(serial_port, [tx_vfo])
+
+  # set the mode
+  command = YaesuCommand("set mode", YaesuInstruction.MODESEL, 5, parse_status_update_5byte,
+                         data1=mode_num)
+  cat_command(serial_port, command)
+
+  # if we swapped VFOs, swap back to original VFO
+  if active_vfo != tx_vfo:
+    handle_set_vfo(serial_port, [active_vfo])
+
+  return HamlibError.to_response(HamlibError.RIG_OK)
+
+
 class FakeRigctld(socketserver.StreamRequestHandler):
   def setup(self):
     super().setup()
@@ -392,7 +577,14 @@ class FakeRigctld(socketserver.StreamRequestHandler):
       "V"             : handle_set_vfo,
       "f"             : handle_get_freq,
       "F"             : handle_set_freq,
-      "m"             : handle_get_mode
+      "m"             : handle_get_mode,
+      "M"             : handle_set_mode,
+      "s"             : handle_get_split_vfo,
+      "S"             : handle_set_split_vfo,
+      "i"             : handle_get_split_freq,
+      "I"             : handle_set_split_freq,
+      "x"             : handle_get_split_mode,
+      "X"             : handle_set_split_mode,
     }
   def handle(self):
     print(f"Connection from: {self.client_address}")
