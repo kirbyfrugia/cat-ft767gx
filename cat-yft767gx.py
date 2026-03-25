@@ -1,8 +1,11 @@
 import atexit
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 import serial
+import socketserver
 import sys
+import traceback
 import time
 
 @dataclass
@@ -11,10 +14,15 @@ class YaesuMemoryChannel:
   ctcss_tone: int = 0
   mode: int = 0
 
+# what's with the shadow stuff? These are cases
+# where the radio's precision doesn't match what
+# callers expect, so when we do a "set" we keep
+# the shadow copy.
 @dataclass
 class YaesuState:
   status_flags: int = 0
   operating_frequency: int = 0
+  operating_frequency_shadow: int = 0
   selected_ctcss_tone: int = 0
   selected_mode: int = 0
   selected_memory_channel: int = 0
@@ -69,21 +77,41 @@ class YaesuCommand:
   def to_bytes(self):
     return bytes([self.data4,self.data3,self.data2,self.data1,self.instruction.value])
 
+class HamlibError:
+  # Success
+  RIG_OK           = 0    # No error, operation completed successfully
+
+  # Common Errors
+  RIG_EINVAL       = -1   # Invalid parameter (e.g. freq out of range)
+  RIG_ECONF        = -2   # Invalid configuration
+  RIG_ENOMEM       = -3   # Internal memory allocation error
+  RIG_ETIMEOUT     = -5   # Radio did not respond within timeout period
+  RIG_EIO          = -6   # Input/Output error (Serial port/USB failure)
+  RIG_EINTERNAL    = -8   # Internal Hamlib/Server error
+  RIG_EPROTO       = -11  # Protocol error (Radio sent garbled data)
+  RIG_ENAVAIL      = -12  # Feature not available on this specific rig
+  RIG_ENOTIMPL     = -13  # Feature not implemented in this server yet
+  RIG_EBUSY        = -16  # VFO or Radio is busy
+  RIG_ENYI         = -17  # Not Yet Implemented
+  RIG_EVFO         = -18  # Invalid VFO
+  RIG_EREJECTED    = -19  # Command rejected by the rig
+
+  @classmethod
+  def to_response(cls, code):
+    return f"RPRT {code}"
+
 serial_port = None
-ack_command = YaesuCommand(friendly_name="ACK", 
-                           instruction=YaesuInstruction.ACK, 
-                           response_size=0, 
-                           response_parser=None)
+ack_command = YaesuCommand("ACK", YaesuInstruction.ACK, 0, None)
 
 yaesu_state = YaesuState()
 
-def close_port(serial_port):
-  print("Closing port...")
+def close_serial_port(serial_port):
+  print("Closing serial port...")
   if (serial_port.is_open):
     serial_port.reset_input_buffer()
     serial_port.reset_output_buffer()
     serial_port.close()
-    time.sleep(1)
+    time.sleep(0.5)
   return
 
 # frequencies are sent in 4 bytes as binary-coded decimal.
@@ -91,9 +119,34 @@ def close_port(serial_port):
 # E.g. 012.34567 MHz would be an array of
 #      [01, 23, 45, 67]
 # This takes the list we get back from the yaesu and converts to an integer
+# The Yaesu also returns in decahertz instead of hertz, so multiply by 10
 def list_to_frequency(freq_list):
-  frequency = int(f"{freq_list[0]:02x}{freq_list[1]:02x}{freq_list[2]:02x}{freq_list[3]:02x}")
+  frequency = int(f"{freq_list[0]:02x}{freq_list[1]:02x}{freq_list[2]:02x}{freq_list[3]:02x}") * 10
   return frequency
+
+def frequency_to_list(frequency):
+  val = int(frequency) // 10 # convert do decahertz
+  
+  s = f"{val:08d}" # turn into 8 dight string
+
+  # convert to BCD bytes  
+  freq_list = [
+      int(s[0:2], 16), # 100MHz & 10MHz
+      int(s[2:4], 16), # 1MHz & 100kHz
+      int(s[4:6], 16), # 10kHz & 1kHz
+      int(s[6:8], 16)  # 100Hz & 10Hz
+  ]
+  
+  return freq_list
+
+# yaesu precision is less than the hamlib's, so we keep
+# the value hamlib tried to set. we respond with hamlib's
+# if the values are equal at the yaesu precision.
+def get_shadow_freqeuncy(yaesu_frequency, shadow_frequency):
+  truncated = math.floor(shadow_frequency / 10)*10
+  print(f"yaesu: {yaesu_frequency}, shadow: {shadow_frequency}, truncated: {truncated}")
+  return shadow_frequency if yaesu_frequency == truncated else yaesu_frequency
+  
 
 def parse_status_update_5byte(status_update):
   yaesu_state.status_flags = status_update[0]
@@ -136,7 +189,7 @@ def cat_command(serial_port, yaesu_command):
   serial_port.write(command_bytes)
   time.sleep(0.005)
   echo_bytes = serial_port.read_until(size=5)
-  #print(f"command echo response: {command_echo}")
+  # print(f"command echo response: {list(echo_bytes)}")
 
   if command_bytes != echo_bytes:
     raise ValueError(f"cat command error. echo does not match data. data: {command_bytes}, echo: {echo_bytes}")
@@ -148,18 +201,30 @@ def cat_command(serial_port, yaesu_command):
   # with varying length responses
   status_update = list(serial_port.read_until(size=yaesu_command.response_size))
   status_update.reverse()
+  # print(f"Status update: {status_update}\n")
   yaesu_command.response_parser(status_update)
-  #print(f"Status update: {status_update}\n")
+
 
   return
 
-def cleanup(serial_port):
+def close_cat_serial(serial_port):
   print("Cleaning up...")
-  command = YaesuCommand("cat disable", YaesuInstruction.CAT_SW, 86, parse_status_update_86byte, 
-                         data1=1)
-  cat_command(serial_port, command)
-  time.sleep(0.25)
-  close_port(serial_port)
+
+  try:
+    command = YaesuCommand("cat disable", YaesuInstruction.CAT_SW, 86, parse_status_update_86byte, 
+                          data1=1)
+    cat_command(serial_port, command)
+  except:
+    print("Error disabling CAT, it was probably not enabled")
+
+  time.sleep(0.5)
+
+  try:
+    close_serial_port(serial_port)
+  except Exception as e:
+    print (f"Error closing serial port: {e}")
+    traceback.print_exc()
+    
 
 def test(serial_port):
   print("Testing all functions")
@@ -170,8 +235,7 @@ def test(serial_port):
   print(f"state: {yaesu_state}")
 
   print("Check command")
-  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte, 
-                         data1=0)
+  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
   cat_command(serial_port, command)
 
   print("Set Frequency")
@@ -187,18 +251,215 @@ def test(serial_port):
                          data1=0x11)
   cat_command(serial_port, command)
 
+def handle_get_powerstat(serial_port, cmd_args):
+  try:
+    command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
+    cat_command(serial_port, command)
+    status = yaesu_state.status_flags & 0b10000000
+    # 00=ON, 01=OFF for yaesu, opposite for rigctl
+    response = "0" if status != 0 else "1"
+  except Exception as e:
+    print("Error checking CAT status, responding with power off")
+    traceback.print_exc()
+    response = "0"
+
+  return response
+
+def handle_chk_vfo(serial_port, cmd_args):
+  return "CHKVFO 1"
+
+def handle_dump_state(serial_port, cmd_args):
+  # this is a straight dump of what rigctld returns for yaesu ft767gx
+  response = "\n".join([
+    "dump_state:"
+    "1",           # Protocol version
+    "1009",        # Rig model (FT-767GX)
+    "2",           # ITU Region
+    # RX Ranges (Lines 4-15 of your log)
+    "1500000.000000 1999900.000000 0xf 5000 100000 0x3 0x80000000",
+    "3500000.000000 3999900.000000 0xf 5000 100000 0x3 0x80000000",
+    "7000000.000000 7499900.000000 0xf 5000 100000 0x3 0x80000000",
+    "10000000.000000 10499900.000000 0xf 5000 100000 0x3 0x80000000",
+    "14000000.000000 14499900.000000 0xf 5000 100000 0x3 0x80000000",
+    "18000000.000000 18499900.000000 0xf 5000 100000 0x3 0x80000000",
+    "21000000.000000 21499900.000000 0xf 5000 100000 0x3 0x80000000",
+    "24500000.000000 24999900.000000 0xf 5000 100000 0x3 0x80000000",
+    "28000000.000000 29999900.000000 0xf 5000 100000 0x3 0x80000000",
+    "50000000.000000 59999900.000000 0x102f 5000 10000 0x3 0x80000000",
+    "144000000.000000 147999900.000000 0x102f 5000 10000 0x3 0x80000000",
+    "430000000.000000 449999990.000000 0x102f 5000 10000 0x3 0x80000000",
+    "0 0 0 0 0 0 0", # End RX list
+    "100000.000000 29999999.000000 0x102f -1 -1 0x0 0x0", # TX range
+    "0 0 0 0 0 0 0", # End TX list (Note: Use 7 zeros to be safe)
+    "0 0 0 0 0",     # Filters
+    "0x102f 10",     # Tuning step 1
+    "0x102f 100",    # Tuning step 2
+    "0 0",           # End tuning steps
+    "0xffffffff 0",  # Attenuator
+    "0 0",           # Preamp
+    "9999",          # Max RIT
+    "0",             # Max XIT
+    "0",             # Max IF Shift
+    "0",             # Announces
+    "", "", "",      # The 3 blank spacers from your log
+    "0x0",           # Get level mask
+    "0x0",           # Set level mask
+    "0x2000000000000", # Get parm mask
+    "0x2000000000000", # Set parm mask
+    "0x0",           # Get func mask
+    "0x0",           # Set func mask
+    "RPRT 0"         # Final terminator
+  ])
+
+  return response
+
+def handle_get_vfo(serial_port, cmd_args):
+  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
+  cat_command(serial_port, command)
+  status = yaesu_state.status_flags & 0b00010000
+  response = "VFO: VFOA" if status == 0 else "VFO: VFOB"
+  return response
+
+def handle_set_vfo(serial_port, cmd_args):
+  vfo_arg = cmd_args[0]
+
+  vfo = -1
+  match vfo_arg:
+    case "VFOA":
+      vfo = 0
+    case "VFOB":
+      vfo = 1
+    case "MEM":
+      vfo = 2
+
+  if vfo == -1:
+    return HamlibError.to_response(HamlibError.RIG_EINVAL)
+
+  command = YaesuCommand("set vfo", YaesuInstruction.VFOMR, 5, parse_status_update_5byte,
+                         data1=vfo)
+  cat_command(serial_port, command)
+
+  response = HamlibError.to_response(HamlibError.RIG_OK)
+  return response
+
+def handle_get_freq(serial_port, cmd_args):
+  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
+  cat_command(serial_port, command)
+  frequency = get_shadow_freqeuncy(yaesu_state.operating_frequency, yaesu_state.operating_frequency_shadow)
+  response = f"{frequency}"
+  return response
+
+def handle_set_freq(serial_port, cmd_args):
+  freq = int(float(cmd_args[0]))
+  yaesu_state.operating_frequency_shadow = freq
+  freq_list = frequency_to_list(freq)
+  print(freq_list)
+  command = YaesuCommand("set freq", YaesuInstruction.FREQ_SET, 5, parse_status_update_5byte,
+                         data1=freq_list[0],
+                         data2=freq_list[1],
+                         data3=freq_list[2],
+                         data4=freq_list[3])
+  cat_command(serial_port, command)
+
+  response = HamlibError.to_response(HamlibError.RIG_OK)
+  return response
+
+def handle_get_mode(serial_port, cmd_args):
+  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
+  cat_command(serial_port, command)
+
+  modes = {
+    0: ("LSB", 2400),
+    1: ("USB", 2400),
+    2: ("CW", 500),
+    3: ("AM", 6000),
+    4: ("FM", 15000),
+    5: ("FSK", 500)
+  }
+  mode = modes[yaesu_state.selected_mode & 0b00000111]
+  response = f"{mode[0]}\n{mode[1]}"
+
+  return response
+
+class FakeRigctld(socketserver.StreamRequestHandler):
+  def setup(self):
+    super().setup()
+    self.commands = {
+      "get_powerstat" : handle_get_powerstat,
+      "chk_vfo"       : handle_chk_vfo,
+      "dump_state"    : handle_dump_state,
+      "v"             : handle_get_vfo,
+      "V"             : handle_set_vfo,
+      "f"             : handle_get_freq,
+      "F"             : handle_set_freq,
+      "m"             : handle_get_mode
+    }
+  def handle(self):
+    print(f"Connection from: {self.client_address}")
+    while True:
+      line = self.rfile.readline()
+
+      if not line: # disconnection
+        break
+
+      parts = line.decode("utf-8").strip().split()
+      if not parts:
+        continue
+
+      cmd_name = parts[0]
+      cmd_args = parts[1:]
+
+      if cmd_name.startswith("\\"):
+        cmd_name = cmd_name[1:]
+
+      print(f"Received command: {cmd_name}, args: {cmd_args}")
+      handler = self.commands.get(cmd_name)
+
+      if handler:
+        try:
+          response = handler(self.server.serial_port, cmd_args)
+        except Exception as e:
+          print(f"Error executing: {cmd_name}: {e}")
+          response = HamlibError.to_response(HamlibError.RIG_EINTERNAL)
+      else:
+        response = HamlibError.to_response(HamlibError.RIG_ENYI)
+
+      print(f"Response: {response}")
+
+      response = f"{response}\n"
+      self.wfile.write(response.encode("utf-8"))
+      self.wfile.flush()
+
 def main():
   serial_port = serial.Serial(
     port="COM3", baudrate=4800, bytesize=8, timeout=2, stopbits=serial.STOPBITS_TWO
   )
 
-  time.sleep(2)
-  atexit.register(cleanup, serial_port)
-  print("opened com port")
+  time.sleep(0.5)
+  print("Opened com port, enabling cat...")
 
-  test(serial_port)
+  command = YaesuCommand("cat enable", YaesuInstruction.CAT_SW, 86, parse_status_update_86byte)
+  cat_command(serial_port, command)
 
-  time.sleep(2)
+  # handle_set_freq(serial_port, ["14074255.000000"])
+
+  host = "127.0.0.1"
+  port = 4532
+
+  with socketserver.TCPServer((host, port), FakeRigctld) as server:
+    server.serial_port = serial_port
+    print(f"Fake rigctld server started on {host}:{port}")
+    try:
+      server.serve_forever()
+    except KeyboardInterrupt:
+      print("\nKeyboardInterrupt received")
+    except ConnectionResetError:
+      print("\nTCP Client disconnected unexpectedly")
+    finally:
+      server.shutdown()
+      server.server_close()
+      close_cat_serial(serial_port)
+      print("TCP port released.")
 
   return 0
 
