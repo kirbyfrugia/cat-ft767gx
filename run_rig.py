@@ -238,11 +238,15 @@ def close_cat_serial(serial_port):
   print("Cleaning up...")
 
   try:
-    command = YaesuCommand("cat disable", YaesuInstruction.CAT_SW, 86, parse_status_update_86byte, 
-                          data1=1)
-    cat_command(serial_port, command)
+    # data1=1 means OFF. We send the command directly and assume it works.
+    command = YaesuCommand("cat disable", YaesuInstruction.CAT_SW, 0, None, data1=1)
+    print(f"Sending command: {command.friendly_name}")
+    serial_port.reset_input_buffer()
+    serial_port.reset_output_buffer()
+    serial_port.write(command.to_bytes())
+    time.sleep(0.1)
   except:
-    print("Error disabling CAT, it was probably not enabled")
+    print("Error disabling CAT, assuming it was already off or disconnected.")
 
   time.sleep(0.5)
 
