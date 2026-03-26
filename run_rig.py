@@ -4,9 +4,13 @@ import re
 import socketserver
 import sys
 import traceback
-import time
 
 from rig_utils import RigUtils, YaesuCommand, YaesuInstruction
+
+
+# ---------------------------------------------------------------------------
+# State dataclasses (owned here; rig_utils has no state of its own)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class YaesuMemoryChannel:
@@ -41,6 +45,91 @@ class YaesuState:
       default_factory=lambda: [YaesuMemoryChannel() for _ in range(10)]
     )
 
+@dataclass
+class RigctlState:
+  tx_vfo: str = ""
+
+yaesu_state = YaesuState()
+rigctl_state = RigctlState()
+
+
+# ---------------------------------------------------------------------------
+# Frequency helpers
+# ---------------------------------------------------------------------------
+
+# frequencies are sent in 4 bytes as binary-coded decimal.
+# it's a hex representation of decimal digits.
+# E.g. 012.34567 MHz would be an array of
+#      [01, 23, 45, 67]
+# This takes the list we get back from the yaesu and converts to an integer.
+# The Yaesu also returns in decahertz instead of hertz, so multiply by 10.
+def list_to_frequency(freq_list):
+  frequency = int(f"{freq_list[0]:02x}{freq_list[1]:02x}{freq_list[2]:02x}{freq_list[3]:02x}") * 10
+  return frequency
+
+def frequency_to_list(frequency):
+  val = int(frequency) // 10  # convert to decahertz
+
+  s = f"{val:08d}"  # turn into 8-digit string
+
+  # convert to BCD bytes
+  freq_list = [
+      int(s[0:2], 16),  # 100MHz & 10MHz
+      int(s[2:4], 16),  # 1MHz & 100kHz
+      int(s[4:6], 16),  # 10kHz & 1kHz
+      int(s[6:8], 16)   # 100Hz & 10Hz
+  ]
+
+  return freq_list
+
+# yaesu precision is less than hamlib's, so we keep
+# the value hamlib tried to set. we respond with hamlib's
+# if the values are equal at the yaesu precision.
+def get_shadow_frequency(yaesu_frequency, shadow_frequency):
+  truncated = math.floor(shadow_frequency / 10) * 10
+  return shadow_frequency if yaesu_frequency == truncated else yaesu_frequency
+
+
+# ---------------------------------------------------------------------------
+# Status update parsers — write into the module-level yaesu_state
+# ---------------------------------------------------------------------------
+
+def parse_status_update_5byte(status_update):
+  yaesu_state.status_flags = status_update[0]
+  yaesu_state.operating_frequency = list_to_frequency(status_update[1:5])
+
+def parse_status_update_8byte(status_update):
+  parse_status_update_5byte(status_update)
+  yaesu_state.selected_ctcss_tone = status_update[5]
+  yaesu_state.selected_mode = status_update[6]
+  yaesu_state.selected_memory_channel = status_update[7]
+
+def parse_status_update_26byte(status_update):
+  parse_status_update_8byte(status_update)
+  yaesu_state.clarifier_frequency = list_to_frequency(status_update[8:12])
+  yaesu_state.clarifier_ctcss_tone = status_update[12]
+  yaesu_state.clarifier_mode = status_update[13]
+  yaesu_state.vfoa_frequency = list_to_frequency(status_update[14:18])
+  yaesu_state.vfoa_ctcss_tone = status_update[18]
+  yaesu_state.vfoa_mode = status_update[19]
+  yaesu_state.vfob_frequency = list_to_frequency(status_update[20:24])
+  yaesu_state.vfob_ctcss_tone = status_update[24]
+  yaesu_state.vfob_mode = status_update[25]
+
+def parse_status_update_86byte(status_update):
+  parse_status_update_26byte(status_update)
+  freq_index = 26
+  for i in range(10):
+    yaesu_state.memory_channels[i].frequency = list_to_frequency(status_update[freq_index:freq_index+4])
+    yaesu_state.memory_channels[i].ctcss_tone = status_update[freq_index+4]
+    yaesu_state.memory_channels[i].mode = status_update[freq_index+5]
+    freq_index = freq_index + 6
+
+
+# ---------------------------------------------------------------------------
+# Hamlib error codes
+# ---------------------------------------------------------------------------
+
 class HamlibError:
   # Success
   RIG_OK           = 0    # No error, operation completed successfully
@@ -64,81 +153,10 @@ class HamlibError:
   def to_response(cls, code):
     return f"RPRT {code}"
 
-@dataclass
-class RigctlState:
-  tx_vfo: str = ""
 
-yaesu_state = YaesuState()
-rigctl_state = RigctlState()
-
-# frequencies are sent in 4 bytes as binary-coded decimal.
-# it's a hex representation of decimal digits.
-# E.g. 012.34567 MHz would be an array of
-#      [01, 23, 45, 67]
-# This takes the list we get back from the yaesu and converts to an integer
-# The Yaesu also returns in decahertz instead of hertz, so multiply by 10
-def list_to_frequency(freq_list):
-  frequency = int(f"{freq_list[0]:02x}{freq_list[1]:02x}{freq_list[2]:02x}{freq_list[3]:02x}") * 10
-  return frequency
-
-def frequency_to_list(frequency):
-  val = int(frequency) // 10 # convert do decahertz
-  
-  s = f"{val:08d}" # turn into 8 dight string
-
-  # convert to BCD bytes  
-  freq_list = [
-      int(s[0:2], 16), # 100MHz & 10MHz
-      int(s[2:4], 16), # 1MHz & 100kHz
-      int(s[4:6], 16), # 10kHz & 1kHz
-      int(s[6:8], 16)  # 100Hz & 10Hz
-  ]
-  
-  return freq_list
-
-# yaesu precision is less than the hamlib's, so we keep
-# the value hamlib tried to set. we respond with hamlib's
-# if the values are equal at the yaesu precision.
-def get_shadow_frequency(yaesu_frequency, shadow_frequency):
-  truncated = math.floor(shadow_frequency / 10)*10
-  # print(f"yaesu: {yaesu_frequency}, shadow: {shadow_frequency}, truncated: {truncated}")
-  return shadow_frequency if yaesu_frequency == truncated else yaesu_frequency
-  
-
-def parse_status_update_5byte(status_update):
-  yaesu_state.status_flags = status_update[0]
-  yaesu_state.operating_frequency = list_to_frequency(status_update[1:5])
-  return
-
-def parse_status_update_8byte(status_update):
-  parse_status_update_5byte(status_update)
-  yaesu_state.selected_ctcss_tone = status_update[5]
-  yaesu_state.selected_mode = status_update[6]
-  yaesu_state.selected_memory_channel = status_update[7]
-  return
-
-def parse_status_update_26byte(status_update):
-  parse_status_update_8byte(status_update)
-  yaesu_state.clarifier_frequency = list_to_frequency(status_update[8:12])
-  yaesu_state.clarifier_ctcss_tone = status_update[12]
-  yaesu_state.clarifier_mode = status_update[13]
-  yaesu_state.vfoa_frequency = list_to_frequency(status_update[14:18])
-  yaesu_state.vfoa_ctcss_tone = status_update[18]
-  yaesu_state.vfoa_mode = status_update[19]
-  yaesu_state.vfob_frequency = list_to_frequency(status_update[20:24])
-  yaesu_state.vfob_ctcss_tone = status_update[24]
-  yaesu_state.vfob_mode = status_update[25]
-  return
-
-def parse_status_update_86byte(status_update):
-  parse_status_update_26byte(status_update)
-  freq_index = 26
-  for i in range(10):
-    yaesu_state.memory_channels[i].frequency = list_to_frequency(status_update[freq_index:freq_index+4])
-    yaesu_state.memory_channels[i].ctcss_tone = status_update[freq_index+4]
-    yaesu_state.memory_channels[i].mode = status_update[freq_index+5]
-    freq_index = freq_index + 6
-  return
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
 
 def handle_get_powerstat(rig_utils, cmd_args):
   try:
@@ -149,7 +167,6 @@ def handle_get_powerstat(rig_utils, cmd_args):
     print("Error checking CAT status, responding with power off")
     traceback.print_exc()
     response = "0"
-
   return response
 
 def handle_chk_vfo(rig_utils, cmd_args):
@@ -162,7 +179,7 @@ def handle_dump_state(rig_utils, cmd_args):
     "1",           # Protocol version
     "1009",        # Rig model (FT-767GX)
     "2",           # ITU Region
-    # RX Ranges (Lines 4-15 of your log)
+    # RX Ranges
     "1500000.000000 1999900.000000 0xf 5000 100000 0x3 0x80000000",
     "3500000.000000 3999900.000000 0xf 5000 100000 0x3 0x80000000",
     "7000000.000000 7499900.000000 0xf 5000 100000 0x3 0x80000000",
@@ -177,7 +194,7 @@ def handle_dump_state(rig_utils, cmd_args):
     "430000000.000000 449999990.000000 0x102f 5000 10000 0x3 0x80000000",
     "0 0 0 0 0 0 0", # End RX list
     "100000.000000 29999999.000000 0x102f -1 -1 0x0 0x0", # TX range
-    "0 0 0 0 0 0 0", # End TX list (Note: Use 7 zeros to be safe)
+    "0 0 0 0 0 0 0", # End TX list
     "0 0 0 0 0",     # Filters
     "0x102f 10",     # Tuning step 1
     "0x102f 100",    # Tuning step 2
@@ -188,7 +205,7 @@ def handle_dump_state(rig_utils, cmd_args):
     "0",             # Max XIT
     "0",             # Max IF Shift
     "0",             # Announces
-    "", "", "",      # The 3 blank spacers from your log
+    "", "", "",      # The 3 blank spacers
     "0x0",           # Get level mask
     "0x0",           # Set level mask
     "0x2000000000000", # Get parm mask
@@ -197,7 +214,6 @@ def handle_dump_state(rig_utils, cmd_args):
     "0x0",           # Set func mask
     "RPRT 0"         # Final terminator
   ])
-
   return response
 
 def handle_get_vfo(rig_utils, cmd_args):
@@ -224,13 +240,11 @@ def handle_set_vfo(rig_utils, cmd_args):
                          data1=vfo)
   rig_utils.cat_command(command)
 
-  response = HamlibError.to_response(HamlibError.RIG_OK)
-  return response
+  return HamlibError.to_response(HamlibError.RIG_OK)
 
 def handle_get_freq(rig_utils, cmd_args):
   frequency = get_shadow_frequency(yaesu_state.operating_frequency, yaesu_state.operating_frequency_shadow)
-  response = f"{frequency}"
-  return response
+  return f"{frequency}"
 
 def handle_set_freq(rig_utils, cmd_args):
   freq = int(float(cmd_args[0]))
@@ -244,8 +258,7 @@ def handle_set_freq(rig_utils, cmd_args):
                          data4=freq_list[3])
   rig_utils.cat_command(command)
 
-  response = HamlibError.to_response(HamlibError.RIG_OK)
-  return response
+  return HamlibError.to_response(HamlibError.RIG_OK)
 
 def handle_get_mode(rig_utils, cmd_args):
   modes = {
@@ -257,13 +270,11 @@ def handle_get_mode(rig_utils, cmd_args):
     5: ("FSK", 500)
   }
   mode = modes[yaesu_state.selected_mode & 0b00000111]
-  response = f"{mode[0]}\n{mode[1]}"
-
-  return response
+  return f"{mode[0]}\n{mode[1]}"
 
 def handle_set_mode(rig_utils, cmd_args):
   requested_mode = cmd_args[0]
-  
+
   match requested_mode:
     case "LSB":
       mode_num = 0x10
@@ -280,7 +291,6 @@ def handle_set_mode(rig_utils, cmd_args):
     case _:
       return HamlibError.to_response(HamlibError.RIG_EINVAL)
 
-  # set the mode
   command = YaesuCommand("set mode", YaesuInstruction.MODESEL, 8, parse_status_update_8byte,
                          data1=mode_num)
   rig_utils.cat_command(command)
@@ -289,9 +299,8 @@ def handle_set_mode(rig_utils, cmd_args):
 
 def handle_get_split_vfo(rig_utils, cmd_args):
   split = (yaesu_state.status_flags & 0b00001000) >> 3
-  split_str = f"{split}"
   tx_vfo = rigctl_state.tx_vfo
-  return f"{split_str}\n{tx_vfo}"
+  return f"{split}\n{tx_vfo}"
 
 def handle_set_split_vfo(rig_utils, cmd_args):
   target_split = int(cmd_args[0])
@@ -320,14 +329,14 @@ def handle_set_split_freq(rig_utils, cmd_args):
   current_tx_freq = yaesu_state.vfoa_frequency_shadow if rigctl_state.tx_vfo == "VFOA" else yaesu_state.vfob_frequency_shadow
   if current_tx_freq == freq:
     return HamlibError.to_response(HamlibError.RIG_OK)
-  
+
   # need to swap VFOs if we are setting transmit VFO but that VFO is not active
   active_vfo = (yaesu_state.status_flags & 0b00010000) >> 4
   tx_vfo = 0 if rigctl_state.tx_vfo == "VFOA" else 1
   if active_vfo != tx_vfo:
     vfo_str = "VFOA" if tx_vfo == 0 else "VFOB"
     handle_set_vfo(rig_utils, [vfo_str])
-  
+
   # set the shadow frequency
   if tx_vfo == 0:
     yaesu_state.vfoa_frequency_shadow = freq
@@ -348,8 +357,7 @@ def handle_set_split_freq(rig_utils, cmd_args):
     vfo_str = "VFOA" if active_vfo == 0 else "VFOB"
     handle_set_vfo(rig_utils, [vfo_str])
 
-  response = HamlibError.to_response(HamlibError.RIG_OK)
-  return response
+  return HamlibError.to_response(HamlibError.RIG_OK)
 
 def handle_get_split_mode(rig_utils, cmd_args):
   modes = {
@@ -395,7 +403,6 @@ def handle_set_split_mode(rig_utils, cmd_args):
     vfo_str = "VFOA" if tx_vfo == 0 else "VFOB"
     handle_set_vfo(rig_utils, [vfo_str])
 
-  # set the mode
   command = YaesuCommand("set mode", YaesuInstruction.MODESEL, 5, parse_status_update_5byte,
                          data1=mode_num)
   rig_utils.cat_command(command)
@@ -409,6 +416,11 @@ def handle_set_split_mode(rig_utils, cmd_args):
 
 def handle_get_lock_mode(rig_utils, cmd_args):
   return "2"
+
+
+# ---------------------------------------------------------------------------
+# TCP server
+# ---------------------------------------------------------------------------
 
 class FakeRigctld(socketserver.StreamRequestHandler):
   def setup(self):
@@ -431,12 +443,13 @@ class FakeRigctld(socketserver.StreamRequestHandler):
       "X"             : handle_set_split_mode,
       "get_lock_mode" : handle_get_lock_mode
     }
+
   def handle(self):
     print(f"Connection from: {self.client_address}")
     while True:
       line = self.rfile.readline()
 
-      if not line: # disconnection
+      if not line:  # disconnection
         break
 
       parts = line.decode("utf-8").strip().split()
@@ -470,16 +483,16 @@ class FakeRigctld(socketserver.StreamRequestHandler):
 
 
 def main():
-  rig_utils = RigUtils()
+  rig = RigUtils()
   try:
-    rig_utils.open_serial_port()
-    rig_utils.start_cat(parse_status_update_86byte)
+    rig.open_serial_port()
+    rig.start_cat(parse_status_update_86byte)
 
     host = "127.0.0.1"
     port = 4532
 
     with socketserver.TCPServer((host, port), FakeRigctld) as server:
-      server.rig_utils = rig_utils
+      server.rig_utils = rig
       print(f"Fake rigctld server started on {host}:{port}")
       try:
         server.serve_forever()
@@ -491,14 +504,14 @@ def main():
         server.shutdown()
         server.server_close()
         print("TCP port released.")
-  
+
   except Exception as e:
     print(f"An error occurred: {e}")
     traceback.print_exc()
-  
+
   finally:
-    rig_utils.stop_cat()
-    rig_utils.close_serial_port()
+    rig.stop_cat()
+    rig.close_serial_port()
 
   return 0
 
