@@ -266,8 +266,6 @@ def close_cat_serial(serial_port):
 
 def handle_get_powerstat(serial_port, cmd_args):
   try:
-    command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
-    cat_command(serial_port, command)
     status = yaesu_state.status_flags & 0b10000000
     # 00=ON, 01=OFF for yaesu, opposite for rigctl
     response = "0" if status != 0 else "1"
@@ -327,8 +325,6 @@ def handle_dump_state(serial_port, cmd_args):
   return response
 
 def handle_get_vfo(serial_port, cmd_args):
-  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
-  cat_command(serial_port, command)
   status = yaesu_state.status_flags & 0b00010000
   response = "VFOA" if status == 0 else "VFOB"
   return response
@@ -356,8 +352,6 @@ def handle_set_vfo(serial_port, cmd_args):
   return response
 
 def handle_get_freq(serial_port, cmd_args):
-  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
-  cat_command(serial_port, command)
   frequency = get_shadow_frequency(yaesu_state.operating_frequency, yaesu_state.operating_frequency_shadow)
   response = f"{frequency}"
   return response
@@ -378,9 +372,6 @@ def handle_set_freq(serial_port, cmd_args):
   return response
 
 def handle_get_mode(serial_port, cmd_args):
-  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
-  cat_command(serial_port, command)
-
   modes = {
     0: ("LSB", 2400),
     1: ("USB", 2400),
@@ -421,8 +412,6 @@ def handle_set_mode(serial_port, cmd_args):
   return HamlibError.to_response(HamlibError.RIG_OK)
 
 def handle_get_split_vfo(serial_port, cmd_args):
-  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
-  cat_command(serial_port, command)
   split = (yaesu_state.status_flags & 0b00001000) >> 3
   split_str = f"{split}"
   tx_vfo = rigctl_state.tx_vfo
@@ -432,9 +421,6 @@ def handle_set_split_vfo(serial_port, cmd_args):
   target_split = int(cmd_args[0])
   tx_vfo = cmd_args[1]
 
-  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
-  cat_command(serial_port, command)
-  
   current_split = 1 if (yaesu_state.status_flags & 0b00001000) else 0
   if target_split != current_split:
     command = YaesuCommand("toggle split", YaesuInstruction.SPLIT_TOG, 26, parse_status_update_26byte,
@@ -446,8 +432,6 @@ def handle_set_split_vfo(serial_port, cmd_args):
   return HamlibError.to_response(HamlibError.RIG_OK)
 
 def handle_get_split_freq(serial_port, cmd_args):
-  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
-  cat_command(serial_port, command)
   tx_freq = yaesu_state.vfob_frequency if rigctl_state.tx_vfo == "VFOB" else yaesu_state.vfoa_frequency
   tx_freq_shadow = yaesu_state.vfob_frequency_shadow if rigctl_state.tx_vfo == "VFOB" else yaesu_state.vfoa_frequency_shadow
   freq = get_shadow_frequency(tx_freq, tx_freq_shadow)
@@ -461,9 +445,6 @@ def handle_set_split_freq(serial_port, cmd_args):
   if current_tx_freq == freq:
     return HamlibError.to_response(HamlibError.RIG_OK)
   
-  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
-  cat_command(serial_port, command)
-
   # need to swap VFOs if we are setting transmit VFO but that VFO is not active
   active_vfo = (yaesu_state.status_flags & 0b00010000) >> 4
   tx_vfo = 0 if rigctl_state.tx_vfo == "VFOA" else 1
@@ -495,9 +476,6 @@ def handle_set_split_freq(serial_port, cmd_args):
   return response
 
 def handle_get_split_mode(serial_port, cmd_args):
-  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
-  cat_command(serial_port, command)
-
   modes = {
     0: ("LSB", 2400),
     1: ("USB", 2400),
@@ -533,9 +511,6 @@ def handle_set_split_mode(serial_port, cmd_args):
   current_tx_mode = yaesu_state.vfoa_mode if rigctl_state.tx_vfo == "VFOA" else yaesu_state.vfob_mode
   if current_tx_mode == mode_num:
     return HamlibError.to_response(HamlibError.RIG_OK)
-
-  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
-  cat_command(serial_port, command)
 
   # need to swap VFOs if we are setting transmit VFO but that VFO is not active
   active_vfo = (yaesu_state.status_flags & 0b00010000) >> 4
