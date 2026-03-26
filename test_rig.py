@@ -1,15 +1,10 @@
 import argparse
-import serial
 import sys
-import time
 import traceback
 
 from run_rig import (
-    YaesuInstruction,
-    YaesuCommand,
     yaesu_state,
     rigctl_state,
-    cat_command,
     handle_get_freq,
     handle_set_freq,
     handle_get_mode,
@@ -26,8 +21,8 @@ from run_rig import (
     parse_status_update_8byte,
     parse_status_update_26byte,
     parse_status_update_86byte,
-    close_serial_port,
 )
+from rig_utils import RigUtils, YaesuCommand, YaesuInstruction
 
 
 def main():
@@ -119,29 +114,12 @@ def main():
 
 
     args = parser.parse_args()
-
-    ser = None
+    
+    rig_utils = RigUtils(port=args.port)
     try:
-        print(f"Attempting to open serial port {args.port}...")
-        ser = serial.Serial(
-            port=args.port,
-            baudrate=4800,
-            bytesize=8,
-            timeout=2,
-            stopbits=serial.STOPBITS_TWO,
-        )
-        time.sleep(0.5)
-        print(f"Port {args.port} opened successfully.")
-    except serial.SerialException as e:
-        print(f"FATAL: Could not open serial port {args.port}: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        print("Enabling CAT mode...")
-        cat_enable_cmd = YaesuCommand(
-            "cat enable", YaesuInstruction.CAT_SW, 86, parse_status_update_86byte, data1=0
-        )
-        cat_command(ser, cat_enable_cmd)
+        rig_utils.open_serial_port()
+        rig_utils.start_cat(parse_status_update_86byte)
+        
         print("CAT Enabled. Initial State:")
         print(yaesu_state)
         print("-" * 20)
@@ -153,64 +131,64 @@ def main():
         # This reduces code duplication and tests the actual logic the server uses.
         if args.command == "get-freq":
             print(f"Executing command :{args.command} ...")
-            freq_response = handle_get_freq(ser, [])
+            freq_response = handle_get_freq(rig_utils, [])
             print(f"Response from rig: {freq_response}")
             was_run_by_handler = True
         elif args.command == "set-freq":
             print(f"Executing command :{args.command} ...")
-            handle_set_freq(ser, [str(args.frequency)])
+            handle_set_freq(rig_utils, [str(args.frequency)])
             was_run_by_handler = True
         elif args.command == "get-mode":
             print(f"Executing command: {args.command}...")
-            mode_response = handle_get_mode(ser, [])
+            mode_response = handle_get_mode(rig_utils, [])
             print(f"Response from rig: {mode_response}")
             was_run_by_handler = True
         elif args.command == "set-mode":
             print(f"Executing command: {args.command}...")
-            handle_set_mode(ser, [args.mode])
+            handle_set_mode(rig_utils, [args.mode])
             was_run_by_handler = True
         elif args.command == "get-vfo":
             print(f"Executing command: {args.command}...")
-            vfo_response = handle_get_vfo(ser, [])
+            vfo_response = handle_get_vfo(rig_utils, [])
             print(f"Response from rig: {vfo_response}")
             was_run_by_handler = True
         elif args.command == "set-vfo":
             print(f"Executing command: {args.command}...")
-            handle_set_vfo(ser, [args.vfo])
+            handle_set_vfo(rig_utils, [args.vfo])
             was_run_by_handler = True
         elif args.command == "get-split-vfo":
             print(f"Executing command: {args.command}...")
             rigctl_state.tx_vfo = args.tx_vfo
-            split_vfo_response = handle_get_split_vfo(ser, [])
+            split_vfo_response = handle_get_split_vfo(rig_utils, [])
             print(f"Response from rig: {split_vfo_response}")
             was_run_by_handler = True
         elif args.command == "set-split-vfo":
             print(f"Executing command: {args.command}...")
-            handle_set_split_vfo(ser, [args.split, args.tx_vfo])
+            handle_set_split_vfo(rig_utils, [args.split, args.tx_vfo])
             was_run_by_handler = True
         elif args.command == "get-split-freq":
             print(f"Executing command: {args.command}...")
             rigctl_state.tx_vfo = args.tx_vfo
-            split_freq_response = handle_get_split_freq(ser, [])
+            split_freq_response = handle_get_split_freq(rig_utils, [])
             print(f"Response from rig: {split_freq_response}")
             was_run_by_handler = True
         elif args.command == "set-split-freq":
             print(f"Executing command: {args.command}...")
             rigctl_state.tx_vfo = args.tx_vfo
-            handle_set_split_freq(ser, [str(args.frequency)])
+            handle_set_split_freq(rig_utils, [str(args.frequency)])
             was_run_by_handler = True
         elif args.command == "get-split-mode":
             print(f"Executing command: {args.command}...")
             rigctl_state.tx_vfo = args.tx_vfo
             # This handler returns the result, which we print
-            split_mode_response = handle_get_split_mode(ser, [])
+            split_mode_response = handle_get_split_mode(rig_utils, [])
             print(f"Response from rig: {split_mode_response}")
             was_run_by_handler = True
 
         elif args.command == "set-split-mode":
             print(f"Executing command: {args.command}...")
             rigctl_state.tx_vfo = args.tx_vfo
-            handle_set_split_mode(ser, [args.mode])
+            handle_set_split_mode(rig_utils, [args.mode])
             was_run_by_handler = True
 
         # For simple commands without handlers or where we want to test the instruction directly,
@@ -230,31 +208,17 @@ def main():
         # Execute the command if it wasn't already run by a handler function
         if cmd_to_run and not was_run_by_handler:
             print(f"Executing command: '{args.command}'...")
-            cat_command(ser, cmd_to_run)
+            rig_utils.cat_command(cmd_to_run)
         
     except Exception:
         print(f"FATAL: An error occurred during CAT command execution:", file=sys.stderr)
         traceback.print_exc()
 
     finally:
-        if ser and ser.is_open:
+        if rig_utils.serial_port and rig_utils.serial_port.is_open:
             print("-" * 20)
-            print("Disabling CAT mode...")
-            try:
-                cat_disable_cmd = YaesuCommand(
-                    "cat disable",
-                    YaesuInstruction.CAT_SW,
-                    86,
-                    parse_status_update_86byte,
-                    data1=1,
-                )
-                cat_command(ser, cat_disable_cmd)
-                print("CAT mode disabled.")
-            except Exception as e:
-                print(f"Warning: Failed to disable CAT mode. May need to power cycle rig. Error: {e}", file=sys.stderr)
-
-            close_serial_port(ser)
-            print("Serial port closed.")
+            rig_utils.stop_cat()
+            rig_utils.close_serial_port()
 
 
 if __name__ == "__main__":
