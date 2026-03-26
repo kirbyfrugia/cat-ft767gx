@@ -1,3 +1,11 @@
+# TODO tomorrow
+# Response: RPRT 0
+# Received command: get_lock_mode, args: []
+# Response: RPRT -17
+# Received command: q, args: []
+# Response: RPRT -17
+
+
 from dataclasses import dataclass, field
 from enum import Enum
 import math
@@ -118,7 +126,7 @@ def close_serial_port(serial_port):
     serial_port.reset_input_buffer()
     serial_port.reset_output_buffer()
     serial_port.close()
-    time.sleep(0.5)
+    time.sleep(0.1)
   return
 
 # frequencies are sent in 4 bytes as binary-coded decimal.
@@ -190,7 +198,13 @@ def parse_status_update_86byte(status_update):
     freq_index = freq_index + 6
   return
 
-def cat_command(serial_port, yaesu_command):
+def write_command_bytes(serial_port, yaesu_command):
+  serial_port.write(yaesu_command.to_bytes())
+  time.sleep(0.005)
+  serial_port.flush()
+  return
+
+def cat_command(serial_port, yaesu_command, expect_status_update=True):
   max_retries = 3
   last_exception = None
 
@@ -199,19 +213,13 @@ def cat_command(serial_port, yaesu_command):
       print(f"Sending command: {yaesu_command.friendly_name} (Attempt {attempt + 1}/{max_retries})")
       command_bytes = yaesu_command.to_bytes()
 
-      # clear buffers, just in case
-      serial_port.reset_input_buffer()
-      serial_port.reset_output_buffer()
-
-      serial_port.write(command_bytes)
-      time.sleep(0.005)
+      write_command_bytes(serial_port, yaesu_command)
       echo_bytes = serial_port.read_until(size=5)
 
       if command_bytes != echo_bytes:
         raise ValueError(f"cat command error. echo does not match data. data: {command_bytes}, echo: {echo_bytes}")
 
-      serial_port.write(ack_command.to_bytes())
-      time.sleep(0.005)
+      write_command_bytes(serial_port, ack_command)
 
       # If we get here, the command was sent and ack'd successfully.
       last_exception = None
@@ -225,12 +233,13 @@ def cat_command(serial_port, yaesu_command):
   if last_exception:
     raise last_exception # Re-raise the last exception if all retries failed
 
-  # reverse the order of the byte array just to make it easier to deal
-  # with varying length responses
-  status_update = list(serial_port.read_until(size=yaesu_command.response_size))
-  status_update.reverse()
-  # print(f"Status update: {status_update}\n")
-  yaesu_command.response_parser(status_update)
+  # when disabling CAT, yaesu doesn't send a status update
+  if expect_status_update:
+    # reverse the order of the byte array just to make it easier to deal
+    # with varying length responses
+    status_update = list(serial_port.read_until(size=yaesu_command.response_size))
+    status_update.reverse()
+    yaesu_command.response_parser(status_update)
 
   return
 
@@ -240,15 +249,13 @@ def close_cat_serial(serial_port):
   try:
     # data1=1 means OFF. We send the command directly and assume it works.
     command = YaesuCommand("cat disable", YaesuInstruction.CAT_SW, 0, None, data1=1)
-    print(f"Sending command: {command.friendly_name}")
-    serial_port.reset_input_buffer()
-    serial_port.reset_output_buffer()
-    serial_port.write(command.to_bytes())
-    time.sleep(0.1)
+    cat_command(serial_port, command, False)
+    #print(f"Sending command: {command.friendly_name}")
+    #write_command_bytes(serial_port, command)
   except:
     print("Error disabling CAT, assuming it was already off or disconnected.")
 
-  time.sleep(0.5)
+  time.sleep(0.25)
 
   try:
     close_serial_port(serial_port)
@@ -256,31 +263,6 @@ def close_cat_serial(serial_port):
     print (f"Error closing serial port: {e}")
     traceback.print_exc()
     
-
-def test(serial_port):
-  print("Testing all functions")
-  print("Enabling CAT")
-  command = YaesuCommand("cat enable", YaesuInstruction.CAT_SW, 86, parse_status_update_86byte, 
-                         data1=0)
-  cat_command(serial_port, command)
-  print(f"state: {yaesu_state}")
-
-  print("Check command")
-  command = YaesuCommand("check", YaesuInstruction.CHECK, 86, parse_status_update_86byte)
-  cat_command(serial_port, command)
-
-  print("Set Frequency")
-  command = YaesuCommand("set frequency", YaesuInstruction.FREQ_SET, 5, parse_status_update_5byte, 
-                         data1=0x01,
-                         data2=0x40,
-                         data3=0x73,
-                         data4=0x25)
-  cat_command(serial_port, command)
-
-  print("Set Mode to USB")
-  command = YaesuCommand("set mode", YaesuInstruction.MODESEL, 8, parse_status_update_8byte, 
-                         data1=0x11)
-  cat_command(serial_port, command)
 
 def handle_get_powerstat(serial_port, cmd_args):
   try:
@@ -631,6 +613,7 @@ class FakeRigctld(socketserver.StreamRequestHandler):
       self.wfile.write(response.encode("utf-8"))
       self.wfile.flush()
 
+
 def main():
   serial_port = serial.Serial(
     port="COM3", baudrate=4800, bytesize=8, timeout=2, stopbits=serial.STOPBITS_TWO
@@ -641,8 +624,6 @@ def main():
 
   command = YaesuCommand("cat enable", YaesuInstruction.CAT_SW, 86, parse_status_update_86byte)
   cat_command(serial_port, command)
-
-  # handle_set_freq(serial_port, ["14074255.000000"])
 
   host = "127.0.0.1"
   port = 4532
@@ -663,6 +644,7 @@ def main():
       print("TCP port released.")
 
   return 0
+
 
 if __name__ == "__main__":
   sys.exit(main())
