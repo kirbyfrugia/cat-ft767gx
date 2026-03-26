@@ -1,0 +1,11 @@
+Memory Channel,Frequency,Offset (Ignored),CTCSS Tone,CTCSS Tone(LowQ=0 HighQ=1),Mode,Description
+0,145290000,-0.6,88.5,0,FM,WA7ABU
+1,147160000,+0.6,100.0,0,FM,W7OSU Vineyard Mtn
+2,146780000,-0.6,156.7,0,FM,K7CVO Mary's Peak
+3,146520000,0,100.0,0,FM,National Calling Frequency
+4,146610000,-0.6,167.9,0,FM,W7VA Lebanon
+5,147300000,+0.6,77.0,0,FM,W7WZA Brownsville
+6,146740000,-0.6,100.0,0,FM,WA7FQD Willamette Heights Park Eugene
+7,146720000,-0.6,100.0,0,FM,W7PXL Junction City
+8,144000000,0,100.0,0,FM,Low end of 2m
+9,147999999,0,100.0,0,FM,High end of 2m
