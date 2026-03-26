@@ -428,7 +428,7 @@ def handle_set_mode(serial_port, cmd_args):
       return HamlibError.to_response(HamlibError.RIG_EINVAL)
 
   # set the mode
-  command = YaesuCommand("set mode", YaesuInstruction.MODESEL, 5, parse_status_update_5byte,
+  command = YaesuCommand("set mode", YaesuInstruction.MODESEL, 8, parse_status_update_8byte,
                          data1=mode_num)
   cat_command(serial_port, command)
 
@@ -451,7 +451,8 @@ def handle_set_split_vfo(serial_port, cmd_args):
   
   current_split = 1 if (yaesu_state.status_flags & 0b00001000) else 0
   if target_split != current_split:
-    command = YaesuCommand("toggle split", YaesuInstruction.SPLIT_TOG, 26, parse_status_update_26byte)
+    command = YaesuCommand("toggle split", YaesuInstruction.SPLIT_TOG, 26, parse_status_update_26byte,
+                           data1=0x30)
     cat_command(serial_port, command)
 
   rigctl_state.tx_vfo = tx_vfo
@@ -481,7 +482,8 @@ def handle_set_split_freq(serial_port, cmd_args):
   active_vfo = (yaesu_state.status_flags & 0b00010000) >> 4
   tx_vfo = 0 if rigctl_state.tx_vfo == "VFOA" else 1
   if active_vfo != tx_vfo:
-    handle_set_vfo(serial_port, [tx_vfo])
+    vfo_str = "VFOA" if tx_vfo == 0 else "VFOB"
+    handle_set_vfo(serial_port, [vfo_str])
   
   # set the shadow frequency
   if tx_vfo == 0:
@@ -500,7 +502,8 @@ def handle_set_split_freq(serial_port, cmd_args):
 
   # if we swapped VFOs, swap back to original VFO
   if active_vfo != tx_vfo:
-    handle_set_vfo(serial_port, [active_vfo])
+    vfo_str = "VFOA" if active_vfo == 0 else "VFOB"
+    handle_set_vfo(serial_port, [vfo_str])
 
   response = HamlibError.to_response(HamlibError.RIG_OK)
   return response
@@ -552,7 +555,8 @@ def handle_set_split_mode(serial_port, cmd_args):
   active_vfo = (yaesu_state.status_flags & 0b00010000) >> 4
   tx_vfo = 0 if rigctl_state.tx_vfo == "VFOA" else 1
   if active_vfo != tx_vfo:
-    handle_set_vfo(serial_port, [tx_vfo])
+    vfo_str = "VFOA" if tx_vfo == 0 else "VFOB"
+    handle_set_vfo(serial_port, [vfo_str])
 
   # set the mode
   command = YaesuCommand("set mode", YaesuInstruction.MODESEL, 5, parse_status_update_5byte,
@@ -561,7 +565,8 @@ def handle_set_split_mode(serial_port, cmd_args):
 
   # if we swapped VFOs, swap back to original VFO
   if active_vfo != tx_vfo:
-    handle_set_vfo(serial_port, [active_vfo])
+    vfo_str = "VFOA" if active_vfo == 0 else "VFOB"
+    handle_set_vfo(serial_port, [vfo_str])
 
   return HamlibError.to_response(HamlibError.RIG_OK)
 
