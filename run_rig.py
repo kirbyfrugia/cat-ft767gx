@@ -158,7 +158,7 @@ class HamlibError:
 # Command handlers
 # ---------------------------------------------------------------------------
 
-def handle_get_powerstat(rig_utils, cmd_args):
+def handle_get_powerstat(rig, cmd_args):
   try:
     status = yaesu_state.status_flags & 0b10000000
     # 00=ON, 01=OFF for yaesu, opposite for rigctl
@@ -169,10 +169,10 @@ def handle_get_powerstat(rig_utils, cmd_args):
     response = "0"
   return response
 
-def handle_chk_vfo(rig_utils, cmd_args):
+def handle_chk_vfo(rig, cmd_args):
   return "CHKVFO 1"
 
-def handle_dump_state(rig_utils, cmd_args):
+def handle_dump_state(rig, cmd_args):
   # this is a straight dump of what rigctld returns for yaesu ft767gx
   response = "\n".join([
     "dump_state:"
@@ -216,12 +216,12 @@ def handle_dump_state(rig_utils, cmd_args):
   ])
   return response
 
-def handle_get_vfo(rig_utils, cmd_args):
+def handle_get_vfo(rig, cmd_args):
   status = yaesu_state.status_flags & 0b00010000
   response = "VFOA" if status == 0 else "VFOB"
   return response
 
-def handle_set_vfo(rig_utils, cmd_args):
+def handle_set_vfo(rig, cmd_args):
   vfo_arg = cmd_args[0]
 
   vfo = -1
@@ -238,15 +238,15 @@ def handle_set_vfo(rig_utils, cmd_args):
 
   command = YaesuCommand("set vfo", YaesuInstruction.VFOMR, 5, parse_status_update_5byte,
                          data1=vfo)
-  rig_utils.cat_command(command)
+  rig.cat_command(command)
 
   return HamlibError.to_response(HamlibError.RIG_OK)
 
-def handle_get_freq(rig_utils, cmd_args):
+def handle_get_freq(rig, cmd_args):
   frequency = get_shadow_frequency(yaesu_state.operating_frequency, yaesu_state.operating_frequency_shadow)
   return f"{frequency}"
 
-def handle_set_freq(rig_utils, cmd_args):
+def handle_set_freq(rig, cmd_args):
   freq = int(float(cmd_args[0]))
   yaesu_state.operating_frequency_shadow = freq
   freq_list = frequency_to_list(freq)
@@ -256,11 +256,11 @@ def handle_set_freq(rig_utils, cmd_args):
                          data2=freq_list[1],
                          data3=freq_list[2],
                          data4=freq_list[3])
-  rig_utils.cat_command(command)
+  rig.cat_command(command)
 
   return HamlibError.to_response(HamlibError.RIG_OK)
 
-def handle_get_mode(rig_utils, cmd_args):
+def handle_get_mode(rig, cmd_args):
   modes = {
     0: ("LSB", 2400),
     1: ("USB", 2400),
@@ -272,7 +272,7 @@ def handle_get_mode(rig_utils, cmd_args):
   mode = modes[yaesu_state.selected_mode & 0b00000111]
   return f"{mode[0]}\n{mode[1]}"
 
-def handle_set_mode(rig_utils, cmd_args):
+def handle_set_mode(rig, cmd_args):
   requested_mode = cmd_args[0]
 
   match requested_mode:
@@ -293,16 +293,16 @@ def handle_set_mode(rig_utils, cmd_args):
 
   command = YaesuCommand("set mode", YaesuInstruction.MODESEL, 8, parse_status_update_8byte,
                          data1=mode_num)
-  rig_utils.cat_command(command)
+  rig.cat_command(command)
 
   return HamlibError.to_response(HamlibError.RIG_OK)
 
-def handle_get_split_vfo(rig_utils, cmd_args):
+def handle_get_split_vfo(rig, cmd_args):
   split = (yaesu_state.status_flags & 0b00001000) >> 3
   tx_vfo = rigctl_state.tx_vfo
   return f"{split}\n{tx_vfo}"
 
-def handle_set_split_vfo(rig_utils, cmd_args):
+def handle_set_split_vfo(rig, cmd_args):
   target_split = int(cmd_args[0])
   tx_vfo = cmd_args[1]
 
@@ -310,19 +310,19 @@ def handle_set_split_vfo(rig_utils, cmd_args):
   if target_split != current_split:
     command = YaesuCommand("toggle split", YaesuInstruction.SPLIT_TOG, 26, parse_status_update_26byte,
                            data1=0x30)
-    rig_utils.cat_command(command)
+    rig.cat_command(command)
 
   rigctl_state.tx_vfo = tx_vfo
 
   return HamlibError.to_response(HamlibError.RIG_OK)
 
-def handle_get_split_freq(rig_utils, cmd_args):
+def handle_get_split_freq(rig, cmd_args):
   tx_freq = yaesu_state.vfob_frequency if rigctl_state.tx_vfo == "VFOB" else yaesu_state.vfoa_frequency
   tx_freq_shadow = yaesu_state.vfob_frequency_shadow if rigctl_state.tx_vfo == "VFOB" else yaesu_state.vfoa_frequency_shadow
   freq = get_shadow_frequency(tx_freq, tx_freq_shadow)
   return f"{freq}"
 
-def handle_set_split_freq(rig_utils, cmd_args):
+def handle_set_split_freq(rig, cmd_args):
   freq = int(float(cmd_args[0]))
 
   # first check to see if the frequency needs to change for tx freq
@@ -335,7 +335,7 @@ def handle_set_split_freq(rig_utils, cmd_args):
   tx_vfo = 0 if rigctl_state.tx_vfo == "VFOA" else 1
   if active_vfo != tx_vfo:
     vfo_str = "VFOA" if tx_vfo == 0 else "VFOB"
-    handle_set_vfo(rig_utils, [vfo_str])
+    handle_set_vfo(rig, [vfo_str])
 
   # set the shadow frequency
   if tx_vfo == 0:
@@ -350,16 +350,16 @@ def handle_set_split_freq(rig_utils, cmd_args):
                          data2=freq_list[1],
                          data3=freq_list[2],
                          data4=freq_list[3])
-  rig_utils.cat_command(command)
+  rig.cat_command(command)
 
   # if we swapped VFOs, swap back to original VFO
   if active_vfo != tx_vfo:
     vfo_str = "VFOA" if active_vfo == 0 else "VFOB"
-    handle_set_vfo(rig_utils, [vfo_str])
+    handle_set_vfo(rig, [vfo_str])
 
   return HamlibError.to_response(HamlibError.RIG_OK)
 
-def handle_get_split_mode(rig_utils, cmd_args):
+def handle_get_split_mode(rig, cmd_args):
   modes = {
     0: ("LSB", 2400),
     1: ("USB", 2400),
@@ -372,7 +372,7 @@ def handle_get_split_mode(rig_utils, cmd_args):
   mode = modes[tx_mode & 0b00000111]
   return f"{mode[0]}\n{mode[1]}"
 
-def handle_set_split_mode(rig_utils, cmd_args):
+def handle_set_split_mode(rig, cmd_args):
   requested_mode = cmd_args[0]
 
   match requested_mode:
@@ -401,20 +401,20 @@ def handle_set_split_mode(rig_utils, cmd_args):
   tx_vfo = 0 if rigctl_state.tx_vfo == "VFOA" else 1
   if active_vfo != tx_vfo:
     vfo_str = "VFOA" if tx_vfo == 0 else "VFOB"
-    handle_set_vfo(rig_utils, [vfo_str])
+    handle_set_vfo(rig, [vfo_str])
 
   command = YaesuCommand("set mode", YaesuInstruction.MODESEL, 5, parse_status_update_5byte,
                          data1=mode_num)
-  rig_utils.cat_command(command)
+  rig.cat_command(command)
 
   # if we swapped VFOs, swap back to original VFO
   if active_vfo != tx_vfo:
     vfo_str = "VFOA" if active_vfo == 0 else "VFOB"
-    handle_set_vfo(rig_utils, [vfo_str])
+    handle_set_vfo(rig, [vfo_str])
 
   return HamlibError.to_response(HamlibError.RIG_OK)
 
-def handle_get_lock_mode(rig_utils, cmd_args):
+def handle_get_lock_mode(rig, cmd_args):
   return "2"
 
 
@@ -466,7 +466,7 @@ class FakeRigctld(socketserver.StreamRequestHandler):
 
       if handler:
         try:
-          response = handler(self.server.rig_utils, cmd_args)
+          response = handler(self.server.rig, cmd_args)
         except Exception as e:
           print(f"Error executing: {cmd_name}: {e}")
           traceback.print_exc()
@@ -492,7 +492,7 @@ def main():
     port = 4532
 
     with socketserver.TCPServer((host, port), FakeRigctld) as server:
-      server.rig_utils = rig
+      server.rig = rig
       print(f"Fake rigctld server started on {host}:{port}")
       try:
         server.serve_forever()
